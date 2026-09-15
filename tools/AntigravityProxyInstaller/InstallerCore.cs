@@ -1,7 +1,9 @@
 using System.Diagnostics;
+using Microsoft.Win32;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
+using System.Security;
 using System.Text.Json;
 
 namespace AntigravityProxyInstaller;
@@ -124,6 +126,314 @@ internal sealed class DeploymentAssessment
         }
 
         return HasMissingFiles || (overwriteExisting && HasDifferentFiles);
+    }
+}
+
+internal static class InstalledApplicationLocator
+{
+    private static readonly string[] SupportedExecutableNames =
+    {
+        "Antigravity.exe",
+        "Antigravity IDE.exe"
+    };
+
+    private static readonly (RegistryHive Hive, RegistryView View, string Path)[] UninstallRoots =
+    {
+        (RegistryHive.CurrentUser, RegistryView.Default, @"Software\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (RegistryHive.CurrentUser, RegistryView.Registry64, @"Software\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (RegistryHive.CurrentUser, RegistryView.Registry32, @"Software\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (RegistryHive.LocalMachine, RegistryView.Registry64, @"Software\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (RegistryHive.LocalMachine, RegistryView.Registry32, @"Software\Microsoft\Windows\CurrentVersion\Uninstall")
+    };
+
+    public static bool TryFindDefault(out TargetInfo? target)
+    {
+        target = null;
+        var candidates = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var executable in EnumerateRegistryCandidates())
+        {
+            AddCandidate(candidates, executable);
+        }
+
+        foreach (var directory in EnumerateKnownDirectories())
+        {
+            foreach (var executable in EnumerateExecutables(directory))
+            {
+                AddCandidate(candidates, executable);
+            }
+        }
+
+        foreach (var executable in candidates)
+        {
+            if (!File.Exists(executable))
+            {
+                continue;
+            }
+
+            var directory = Path.GetDirectoryName(executable);
+            if (string.IsNullOrWhiteSpace(directory))
+            {
+                continue;
+            }
+
+            target = new TargetInfo(
+                executable,
+                executable,
+                directory,
+                PeArchitectureReader.Read(executable));
+            return true;
+        }
+
+        return false;
+    }
+
+    private static IEnumerable<string> EnumerateRegistryCandidates()
+    {
+        var results = new List<string>();
+        foreach (var root in UninstallRoots)
+        {
+            RegistryKey? baseKey = null;
+            RegistryKey? uninstallKey = null;
+            try
+            {
+                baseKey = RegistryKey.OpenBaseKey(root.Hive, root.View);
+                uninstallKey = baseKey.OpenSubKey(root.Path);
+                if (uninstallKey is null)
+                {
+                    continue;
+                }
+
+                foreach (var subKeyName in uninstallKey.GetSubKeyNames())
+                {
+                    using var appKey = uninstallKey.OpenSubKey(subKeyName);
+                    if (appKey is null)
+                    {
+                        continue;
+                    }
+
+                    var displayName = appKey.GetValue("DisplayName") as string;
+                    if (string.IsNullOrWhiteSpace(displayName) ||
+                        displayName.IndexOf("Antigravity", StringComparison.OrdinalIgnoreCase) < 0)
+                    {
+                        continue;
+                    }
+
+                    foreach (var valueName in new[] { "InstallLocation", "DisplayIcon", "InstallSource" })
+                    {
+                        if (appKey.GetValue(valueName) is string value && !string.IsNullOrWhiteSpace(value))
+                        {
+                            foreach (var executable in ExpandCandidate(value))
+                            {
+                                results.Add(executable);
+                            }
+                        }
+                    }
+                }
+            }
+            catch (SecurityException)
+            {
+                // Some machine-wide uninstall keys can be unreadable without elevation.
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // Continue with the remaining registry views and known locations.
+            }
+            catch (PlatformNotSupportedException)
+            {
+                // A registry view may be unavailable on 32-bit Windows.
+            }
+            catch (ArgumentException)
+            {
+                // Ignore malformed or unsupported registry roots.
+            }
+            finally
+            {
+                uninstallKey?.Dispose();
+                baseKey?.Dispose();
+            }
+        }
+
+        return results;
+    }
+
+    private static IEnumerable<string> EnumerateKnownDirectories()
+    {
+        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        var programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+        var programFilesX86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
+
+        foreach (var root in new[] { localAppData, programFiles, programFilesX86 })
+        {
+            if (string.IsNullOrWhiteSpace(root))
+            {
+                continue;
+            }
+
+            yield return Path.Combine(root, "Programs", "Antigravity IDE");
+            yield return Path.Combine(root, "Programs", "Antigravity");
+            yield return Path.Combine(root, "Antigravity IDE");
+            yield return Path.Combine(root, "Antigravity");
+        }
+    }
+
+    private static IEnumerable<string> EnumerateExecutables(string directory)
+    {
+        if (!Directory.Exists(directory))
+        {
+            yield break;
+        }
+
+        foreach (var name in SupportedExecutableNames)
+        {
+            yield return Path.Combine(directory, name);
+        }
+
+        string[] nested;
+        try
+        {
+            nested = Directory.EnumerateFiles(directory, "*.exe", SearchOption.AllDirectories)
+                .Where(path => SupportedExecutableNames.Any(name =>
+                    string.Equals(Path.GetFileName(path), name, StringComparison.OrdinalIgnoreCase)))
+                .Take(20)
+                .ToArray();
+        }
+        catch (IOException)
+        {
+            yield break;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            yield break;
+        }
+
+        foreach (var path in nested)
+        {
+            yield return path;
+        }
+    }
+
+    private static IEnumerable<string> ExpandCandidate(string value)
+    {
+        var expanded = Environment.ExpandEnvironmentVariables(value.Trim());
+        if (expanded.StartsWith('"'))
+        {
+            var closingQuote = expanded.IndexOf('"', 1);
+            expanded = closingQuote > 1 ? expanded[1..closingQuote] : expanded.Trim('"');
+        }
+        else
+        {
+            var commaIndex = expanded.IndexOf(',');
+            if (commaIndex >= 0)
+            {
+                expanded = expanded[..commaIndex];
+            }
+
+            expanded = expanded.Trim().Trim('"');
+        }
+        if (string.IsNullOrWhiteSpace(expanded))
+        {
+            yield break;
+        }
+
+        if (Directory.Exists(expanded))
+        {
+            foreach (var executable in EnumerateExecutables(expanded))
+            {
+                yield return executable;
+            }
+
+            yield break;
+        }
+
+        if (Path.GetExtension(expanded).Equals(".exe", StringComparison.OrdinalIgnoreCase))
+        {
+            yield return expanded;
+            yield break;
+        }
+
+        foreach (var executable in EnumerateExecutables(expanded))
+        {
+            yield return executable;
+        }
+    }
+
+    private static void AddCandidate(HashSet<string> candidates, string path)
+    {
+        try
+        {
+            var fullPath = Path.GetFullPath(path);
+            if (SupportedExecutableNames.Any(name =>
+                    string.Equals(Path.GetFileName(fullPath), name, StringComparison.OrdinalIgnoreCase)))
+            {
+                candidates.Add(fullPath);
+            }
+        }
+        catch (ArgumentException)
+        {
+            // Ignore malformed registry values.
+        }
+    }
+}
+
+internal sealed record BuildResult(bool Succeeded, int ExitCode, string Output);
+
+internal static class NativeBuildService
+{
+    public static async Task<BuildResult> BuildAsync(string scriptPath, string architecture, CancellationToken cancellationToken)
+    {
+        var root = Path.GetDirectoryName(scriptPath)
+                   ?? throw new InvalidOperationException("无法确定项目根目录。");
+        var powershell = Environment.GetEnvironmentVariable("ComSpec") is not null
+            ? "powershell.exe"
+            : "pwsh";
+        var outputEncoding = System.Text.Encoding.UTF8;
+        var escapedScriptPath = scriptPath.Replace("'", "''");
+        var command = $"[Console]::OutputEncoding = [Text.Encoding]::UTF8; & '{escapedScriptPath}' -Config Release -Arch {architecture} -SkipTests; exit $LASTEXITCODE";
+        var arguments = $"-NoProfile -ExecutionPolicy Bypass -Command \"{command.Replace("\"", "\\\"")}\"";
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = powershell,
+            Arguments = arguments,
+            WorkingDirectory = root,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            StandardOutputEncoding = outputEncoding,
+            StandardErrorEncoding = outputEncoding
+        };
+
+        using var process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
+        if (!process.Start())
+        {
+            throw new InvalidOperationException("无法启动 PowerShell 编译进程。");
+        }
+
+        var outputTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
+        var errorTask = process.StandardError.ReadToEndAsync(cancellationToken);
+        await process.WaitForExitAsync(cancellationToken);
+        var output = (await outputTask) + Environment.NewLine + (await errorTask);
+        return new BuildResult(process.ExitCode == 0, process.ExitCode, output.Trim());
+    }
+
+    public static bool TryFindBuildScript(out string scriptPath)
+    {
+        var current = new DirectoryInfo(AppContext.BaseDirectory);
+        for (var depth = 0; depth < 8 && current is not null; depth++)
+        {
+            var candidate = Path.Combine(current.FullName, "build.ps1");
+            if (File.Exists(candidate))
+            {
+                scriptPath = candidate;
+                return true;
+            }
+
+            current = current.Parent;
+        }
+
+        scriptPath = string.Empty;
+        return false;
     }
 }
 
