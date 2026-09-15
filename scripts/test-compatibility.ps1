@@ -85,6 +85,7 @@ if (-not $SkipReleaseLayout) {
 
     Assert-FileExists (Join-Path $Ide "version.dll")
     Assert-FileExists (Join-Path $Ide "config.json")
+    Assert-FileExists (Join-Path $Ide "AntigravityProxyInstaller.exe")
     Assert-FileExists (Join-Path $Cli "dbghelp.dll")
     Assert-FileExists (Join-Path $Cli "antigravity_proxy.dll")
     Assert-FileExists (Join-Path $Cli "config.json")
@@ -135,6 +136,7 @@ if (-not $SkipReleaseLayout) {
     $IdeEntries = Get-ZipEntryNames $IdeZip
     Assert-ZipEntry $IdeEntries "ide/version.dll"
     Assert-ZipEntry $IdeEntries "ide/config.json"
+    Assert-ZipEntry $IdeEntries "ide/AntigravityProxyInstaller.exe"
     Assert-ZipEntry $IdeEntries "config-web.html"
     Assert-ZipEntry $IdeEntries "使用说明.md"
     if ($IdeEntries -match '(^|/)cli/' -or $IdeEntries -match 'dbghelp\.dll$' -or $IdeEntries -match 'antigravity_proxy\.dll$') {

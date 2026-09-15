@@ -233,6 +233,12 @@ Copy `version.dll` and `config.json` to Antigravity’s main program directory (
 
 For **Antigravity CLI**, copy `dbghelp.dll`, `version.dll`, and `config.json` next to `agy.exe`. `agy.exe` loads the colocated `dbghelp.dll`, which then loads `version.dll`; no separate launcher is required.
 
+#### One-click deployment tool
+
+The IDE package and `output\ide` include `AntigravityProxyInstaller.exe`. Open it, drag an Antigravity shortcut from the desktop or Start menu into the window, and the tool will resolve the actual executable and installation directory. It then checks whether `version.dll` and `config.json` are present. Click `Copy missing files` to deploy them after the checks pass.
+
+Existing files are not overwritten by default. If a file differs from the current build, enable the overwrite option; existing files are backed up first. Fully exit Antigravity before deploying.
+
 #### Antigravity 2.0 Notes
 
 Antigravity 2.0 added/renamed key processes. The default config now covers:

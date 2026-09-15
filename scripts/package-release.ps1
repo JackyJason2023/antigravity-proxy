@@ -28,6 +28,7 @@ $tag = "v$normalizedVersion"
 $requiredFiles = @(
     "ide\version.dll",
     "ide\config.json",
+    "ide\AntigravityProxyInstaller.exe",
     "cli\dbghelp.dll",
     "cli\antigravity_proxy.dll",
     "cli\config.json",

@@ -22,8 +22,25 @@ param(
     [switch]$Clean,
     [switch]$RunTests,
     [switch]$SkipTests,
+    [string]$Generator = "",
     [switch]$Help
 )
+
+# 某些宿主环境会同时注入大小写不同的 PATH/Path。Windows 本身不区分大小写，
+# 但 .NET/MSBuild 枚举进程环境时可能把它们当成重复字典键，导致 MSB6001。
+function Normalize-ProcessEnvironment {
+    $pathValue = $env:Path
+    if ([string]::IsNullOrWhiteSpace($pathValue)) {
+        return
+    }
+
+    # 先删除两个可能的拼写，再只写回一个键，确保后续工具链看到唯一的 Path。
+    Remove-Item -LiteralPath Env:PATH -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath Env:Path -ErrorAction SilentlyContinue
+    $env:Path = $pathValue
+}
+
+Normalize-ProcessEnvironment
 
 # ============================================================
 # 版本信息 (在此处统一管理版本号)
@@ -72,6 +89,7 @@ Antigravity-Proxy 编译脚本
     -Clean                   清理后重新编译
     -RunTests                构建并运行 CTest 回归测试
     -SkipTests               显式跳过测试步骤（默认行为）
+    -Generator <名称>        覆盖 CMake 生成器；默认自动选择可用的 Visual Studio
     -Verbose                 输出详细构建日志（PowerShell 通用参数）
     -Help                    显示帮助信息
 
@@ -84,6 +102,73 @@ Antigravity-Proxy 编译脚本
     .\build.ps1 -RunTests            # 编译并运行 CTest
     .\build.ps1 -Verbose             # 显示详细编译输出
 "@
+}
+
+function Resolve-CMakeGenerator {
+    param(
+        [Parameter(Mandatory = $false)]
+        [string]$RequestedGenerator
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($RequestedGenerator)) {
+        return $RequestedGenerator.Trim()
+    }
+
+    $vsWhereCandidates = @()
+    if ($env:ProgramFiles) {
+        $vsWhereCandidates += Join-Path $env:ProgramFiles "Microsoft Visual Studio\Installer\vswhere.exe"
+    }
+    if (${env:ProgramFiles(x86)}) {
+        $vsWhereCandidates += Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+    }
+    $vsWhere = $vsWhereCandidates |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+        Select-Object -First 1
+
+    if (-not $vsWhere) {
+        throw "未找到 vswhere.exe，无法自动定位 Visual Studio。请安装带 C++ 工具的 Visual Studio，或通过 -Generator 手动指定 CMake 生成器。"
+    }
+
+    $installations = @()
+    try {
+        $vsJson = & $vsWhere -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -format json 2>$null
+        if ($LASTEXITCODE -eq 0 -and $vsJson) {
+            $installations = @($vsJson | ConvertFrom-Json)
+        }
+    } catch {
+        $installations = @()
+    }
+
+    $generatorMap = @{
+        18 = "Visual Studio 18 2026"
+        17 = "Visual Studio 17 2022"
+        16 = "Visual Studio 16 2019"
+        15 = "Visual Studio 15 2017"
+    }
+    $cmakeCommand = Get-Command cmake -ErrorAction SilentlyContinue
+    if (-not $cmakeCommand) {
+        throw "CMake 未找到，请确保 CMake 已安装并添加到 PATH"
+    }
+    $cmakeHelp = (& $cmakeCommand.Source --help 2>$null | Out-String)
+    $available = @{}
+    foreach ($installation in $installations) {
+        $versionText = [string]$installation.installationVersion
+        if ($versionText -notmatch '^([0-9]+)\.') { continue }
+        $major = [int]$Matches[1]
+        if ($generatorMap.ContainsKey($major)) {
+            $candidate = $generatorMap[$major]
+            if ($cmakeHelp.Contains($candidate)) {
+                $available[$major] = $candidate
+            }
+        }
+    }
+
+    if ($available.Count -eq 0) {
+        $installedVersions = [string[]]($installations | ForEach-Object { $_.installationVersion })
+        throw "未找到 CMake 支持的 Visual Studio C++ 工具链。可用 Visual Studio 版本：$($installedVersions -join ', ')"
+    }
+
+    return ($available.Keys | Sort-Object -Descending | Select-Object -First 1 | ForEach-Object { $available[$_] })
 }
 
 # ============================================================
@@ -109,11 +194,13 @@ $UseStaticRuntime = $true
 if ($DynamicRuntime) { $UseStaticRuntime = $false }
 elseif ($StaticRuntime) { $UseStaticRuntime = $true }
 $RuntimeLabel = if ($UseStaticRuntime) { "静态(/MT)" } else { "动态(/MD)" }
+$InstallerProject = Join-Path $ScriptDir "tools\AntigravityProxyInstaller\AntigravityProxyInstaller.csproj"
 
 Write-Header "Antigravity-Proxy 编译开始"
 Write-Host "  配置: $Config" -ForegroundColor White
 Write-Host "  架构: $Arch" -ForegroundColor White
 Write-Host "  运行库: $RuntimeLabel" -ForegroundColor White
+Write-Host "  CMake 生成器: 自动检测" -ForegroundColor White
 Write-Host "  构建目录: $BuildDir" -ForegroundColor White
 Write-Host "  详细输出: $(if ($PSBoundParameters.ContainsKey('Verbose')) { '开启' } else { '关闭' })" -ForegroundColor White
 Write-Host ""
@@ -131,6 +218,20 @@ if (-not $cmake) {
     exit 1
 }
 Write-Success "CMake 已找到: $($cmake.Source)"
+
+$CMakeGenerator = Resolve-CMakeGenerator -RequestedGenerator $Generator
+Write-Success "CMake 生成器: $CMakeGenerator"
+
+$dotnet = Get-Command dotnet -ErrorAction SilentlyContinue
+if (-not $dotnet) {
+    Write-Error "未找到 .NET SDK，无法编译桌面部署工具"
+    exit 1
+}
+if (-not (Test-Path -LiteralPath $InstallerProject -PathType Leaf)) {
+    Write-Error "未找到部署工具项目: $InstallerProject"
+    exit 1
+}
+Write-Success ".NET SDK 已找到: $($dotnet.Source)"
 
 # 检查 nlohmann/json
 $jsonHeader = Join-Path $ScriptDir "include\nlohmann\json.hpp"
@@ -167,8 +268,7 @@ if ($Clean -and (Test-Path $BuildDir)) {
 # ============================================================
 
 if (-not (Test-Path $BuildDir)) {
-    Write-Step "创建构建目录..."
-    New-Item -ItemType Directory -Path $BuildDir | Out-Null
+    Write-Step "构建目录将在 CMake 配置时自动创建..."
 }
 
 # ============================================================
@@ -179,58 +279,53 @@ Write-Step "运行 CMake 配置..."
 
 $cmakeArch = if ($Arch -eq "x64") { "x64" } else { "Win32" }
 
-Push-Location $BuildDir
-try {
-    $cmakeArgs = @(
-        "..",
-        "-G", "Visual Studio 17 2022",
-        "-A", $cmakeArch
-    )
-    if ($UseStaticRuntime) {
-        $cmakeArgs += "-DSTATIC_RUNTIME=ON"
-    } else {
-        $cmakeArgs += "-DSTATIC_RUNTIME=OFF"
-    }
-    # 显式覆盖缓存值，确保 CI 的测试开关不受既有构建目录影响。
-    $buildTestsValue = if ($RunTests) { "ON" } else { "OFF" }
-    $cmakeArgs += "-DBUILD_TESTS=$buildTestsValue"
-
-    $cmakeResult = & cmake @cmakeArgs 2>&1
-    $cmakeFailed = ($LASTEXITCODE -ne 0)
-
-    # 处理项目目录迁移后的旧缓存：自动清理并重试一次
-    if ($cmakeFailed) {
-        # 兼容 Windows PowerShell 5.1:
-        # - 2>&1 可能返回 ErrorRecord 而非纯字符串
-        # - 输出可能按控制台宽度换行，导致关键句子被拆断
-        $cmakeText = (($cmakeResult | ForEach-Object { $_.ToString() }) -join "`n")
-        $cmakeTextNormalized = [regex]::Replace($cmakeText, "\s+", " ")
-        $isCacheMismatch = $cmakeTextNormalized -match "CMakeCache\.txt directory .* is different than the directory" -or
-                          $cmakeTextNormalized -match "does not match the source .* used to generate cache"
-
-        if ($isCacheMismatch) {
-            Pop-Location
-            Write-Step "检测到 CMake 缓存路径不匹配，自动清理构建目录后重试..."
-            if (Test-Path $BuildDir) {
-                Remove-Item -Recurse -Force $BuildDir
-            }
-            New-Item -ItemType Directory -Path $BuildDir | Out-Null
-
-            Push-Location $BuildDir
-            $cmakeResult = & cmake @cmakeArgs 2>&1
-            $cmakeFailed = ($LASTEXITCODE -ne 0)
-        }
-    }
-
-    if ($cmakeFailed) {
-        Write-Error "CMake 配置失败"
-        Write-Host $cmakeResult -ForegroundColor Red
-        exit 1
-    }
-    Write-Success "CMake 配置完成"
-} finally {
-    Pop-Location
+$cmakeArgs = @(
+    "-S", $ScriptDir,
+    "-B", $BuildDir,
+    "-G", $CMakeGenerator,
+    "-A", $cmakeArch,
+    "-DCMAKE_VS_GLOBALS=TrackFileAccess=false"
+)
+if ($UseStaticRuntime) {
+    $cmakeArgs += "-DSTATIC_RUNTIME=ON"
+} else {
+    $cmakeArgs += "-DSTATIC_RUNTIME=OFF"
 }
+# 显式覆盖缓存值，确保 CI 的测试开关不受既有构建目录影响。
+$buildTestsValue = if ($RunTests) { "ON" } else { "OFF" }
+$cmakeArgs += "-DBUILD_TESTS=$buildTestsValue"
+
+$cmakeResult = & $cmake.Source @cmakeArgs 2>&1
+$cmakeFailed = ($LASTEXITCODE -ne 0)
+
+# 处理项目目录迁移或生成器切换后的旧缓存：自动清理并重试一次
+if ($cmakeFailed) {
+    # 兼容 Windows PowerShell 5.1:
+    # - 2>&1 可能返回 ErrorRecord 而非纯字符串
+    # - 输出可能按控制台宽度换行，导致关键句子被拆断
+    $cmakeText = (($cmakeResult | ForEach-Object { $_.ToString() }) -join "`n")
+    $cmakeTextNormalized = [regex]::Replace($cmakeText, "\s+", " ")
+    $isCacheMismatch = $cmakeTextNormalized -match "CMakeCache\.txt directory .* is different than the directory" -or
+                      $cmakeTextNormalized -match "does not match the source .* used to generate cache"
+    $isGeneratorMismatch = $cmakeTextNormalized -match "generator .* does not match the generator used previously" -or
+                           $cmakeTextNormalized -match "does not match the generator used previously"
+
+    if ($isCacheMismatch -or $isGeneratorMismatch) {
+        Write-Step "检测到 CMake 缓存与当前构建环境不匹配，自动清理构建目录后重试..."
+        if (Test-Path $BuildDir) {
+            Remove-Item -Recurse -Force $BuildDir
+        }
+        $cmakeResult = & $cmake.Source @cmakeArgs 2>&1
+        $cmakeFailed = ($LASTEXITCODE -ne 0)
+    }
+}
+
+if ($cmakeFailed) {
+    Write-Error "CMake 配置失败"
+    Write-Host $cmakeResult -ForegroundColor Red
+    exit 1
+}
+Write-Success "CMake 配置完成"
 
 # ============================================================
 # 步骤 5: 编译
@@ -238,25 +333,23 @@ try {
 
 Write-Step "开始编译 ($Config $Arch)..."
 
-Push-Location $BuildDir
-try {
-    $buildArgs = @("--build", ".", "--config", $Config)
-    if ($PSBoundParameters.ContainsKey('Verbose')) {
-        $buildArgs += "--verbose"
-    }
-    $buildResult = & cmake @buildArgs 2>&1
-    if ($PSBoundParameters.ContainsKey('Verbose')) {
-        $buildResult | ForEach-Object { Write-Host $_ }
-    }
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error "编译失败"
-        Write-Host $buildResult -ForegroundColor Red
-        exit 1
-    }
-    Write-Success "编译完成"
-} finally {
-    Pop-Location
+$buildArgs = @("--build", $BuildDir, "--config", $Config)
+if ($PSBoundParameters.ContainsKey('Verbose')) {
+    $buildArgs += "--verbose"
 }
+$buildArgs += "--"
+$buildArgs += "/p:TrackFileAccess=false"
+$buildArgs += "/nr:false"
+$buildResult = & $cmake.Source @buildArgs 2>&1
+if ($PSBoundParameters.ContainsKey('Verbose')) {
+    $buildResult | ForEach-Object { Write-Host $_ }
+}
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "编译失败"
+    Write-Host $buildResult -ForegroundColor Red
+    exit 1
+}
+Write-Success "编译完成"
 
 # ============================================================
 # 步骤 5.5: 可选 CTest 回归
@@ -266,7 +359,12 @@ if ($RunTests) {
     Write-Step "运行 CTest 回归测试..."
     Push-Location $BuildDir
     try {
-        $ctestResult = & ctest -C $Config --output-on-failure 2>&1
+        $ctestCommand = Get-Command ctest -ErrorAction SilentlyContinue
+        if (-not $ctestCommand) {
+            Write-Error "CTest 未找到"
+            exit 1
+        }
+        $ctestResult = & $ctestCommand.Source -C $Config --output-on-failure 2>&1
         $ctestFailed = ($LASTEXITCODE -ne 0)
         $ctestResult | ForEach-Object { Write-Host $_ }
         if ($ctestFailed) {
@@ -427,7 +525,64 @@ foreach ($configPath in $configPaths) {
 }
 
 # ============================================================
-# 步骤 9: 生成使用说明
+# 步骤 9: 编译桌面部署工具
+# ============================================================
+
+Write-Step "编译桌面部署工具..."
+
+$installerRuntime = if ($Arch -eq "x86") { "win-x86" } else { "win-x64" }
+$installerPublishDir = Join-Path $BuildDir "installer-publish-$Arch"
+if (Test-Path -LiteralPath $installerPublishDir) {
+    Remove-Item -LiteralPath $installerPublishDir -Recurse -Force
+}
+New-Item -ItemType Directory -Path $installerPublishDir -Force | Out-Null
+
+$installerRestoreArgs = @(
+    "restore",
+    $InstallerProject,
+    "--runtime", $installerRuntime,
+    "--ignore-failed-sources",
+    "--nologo",
+    "-p:NuGetAudit=false"
+)
+$installerRestoreResult = & $dotnet.Source @installerRestoreArgs 2>&1
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "桌面部署工具依赖还原失败"
+    Write-Host $installerRestoreResult -ForegroundColor Red
+    exit 1
+}
+
+$installerArgs = @(
+    "publish",
+    $InstallerProject,
+    "--configuration", $Config,
+    "--runtime", $installerRuntime,
+    "--self-contained", "true",
+    "--output", $installerPublishDir,
+    "--nologo",
+    "-p:PublishSingleFile=true",
+    "-p:IncludeNativeLibrariesForSelfExtract=true",
+    "-p:EnableCompressionInSingleFile=true",
+    "-p:DebugType=None",
+    "--no-restore"
+)
+$installerBuildResult = & $dotnet.Source @installerArgs 2>&1
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "桌面部署工具编译失败"
+    Write-Host $installerBuildResult -ForegroundColor Red
+    exit 1
+}
+
+$installerExe = Join-Path $installerPublishDir "AntigravityProxyInstaller.exe"
+if (-not (Test-Path -LiteralPath $installerExe -PathType Leaf)) {
+    Write-Error "未找到桌面部署工具产物: $installerExe"
+    exit 1
+}
+Copy-Item -LiteralPath $installerExe -Destination (Join-Path $IdeOutputDir "AntigravityProxyInstaller.exe") -Force
+Write-Success "桌面部署工具已复制到 output\ide"
+
+# ============================================================
+# 步骤 10: 生成使用说明
 # ============================================================
 
 Write-Step "生成使用说明..."
@@ -541,7 +696,10 @@ FAILED_PRECONDITION (code 400): User location is not supported for the API use.
 Test-NetConnection -ComputerName 127.0.0.1 -Port 7890
 ```
 
-### 3. 启动目标程序
+### 3. 一键部署工具
+IDE 发布目录中包含 `AntigravityProxyInstaller.exe`。双击打开后，将桌面或开始菜单中的 Antigravity 快捷方式拖入窗口，工具会自动识别执行文件和目标目录，并检查 `version.dll` 与 `config.json`。检查通过后点击“复制缺少的文件”即可部署。工具默认不覆盖已有文件；覆盖前会自动备份。部署前请完全退出 Antigravity。
+
+### 4. 启动目标程序
 直接启动目标程序，DLL 会自动加载并重定向网络流量。
 
 ## 配置文件说明
@@ -671,7 +829,7 @@ $usageDoc | Out-File -FilePath $usagePath -Encoding UTF8
 Write-Success "使用说明已生成: $usagePath"
 
 # ============================================================
-# 步骤 10: 复制配置工具
+# 步骤 11: 复制配置工具
 # ============================================================
 
 Write-Step "复制配置工具..."
@@ -697,5 +855,5 @@ Get-ChildItem $OutputDir -Recurse -File | ForEach-Object {
     Write-Host "  - $relativePath" -ForegroundColor Gray
 }
 Write-Host ""
-Write-Host "下一步: 桌面端复制 output\ide；CLI 复制 output\cli。请勿混装两个目录。" -ForegroundColor Yellow
+Write-Host "下一步: 双击 output\ide\AntigravityProxyInstaller.exe 部署桌面端；CLI 复制 output\cli。请勿混装两个目录。" -ForegroundColor Yellow
 Write-Host ""

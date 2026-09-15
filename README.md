@@ -239,6 +239,12 @@ Release 按架构和运行目标提供四个独立压缩包，下载时只选实
 
 > `version.dll` 与 `config.json` 必须来自同一次构建且架构一致。当前版本默认对宿主进程启用全量网络 Hook；启动日志应出现 `使用全量模式`，随后再以 OAuth 回调和业务请求日志做功能验收。
 
+#### 一键部署工具
+
+IDE 压缩包和 `output\ide` 目录中包含 `AntigravityProxyInstaller.exe`。双击打开后，将桌面或开始菜单中的 Antigravity 快捷方式拖入窗口，工具会自动识别快捷方式指向的执行文件和目标目录，并检查 `version.dll`、`config.json` 是否存在。检查通过后点击“复制缺少的文件”即可部署。
+
+工具默认不覆盖已有文件；如果文件内容与当前构建不同，可勾选覆盖选项，覆盖前会自动备份。部署前请完全退出 Antigravity。
+
 #### Antigravity 2.0 注意事项
 
 Antigravity 2.0 新增/改名了关键进程，默认配置已覆盖：
