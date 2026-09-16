@@ -697,7 +697,7 @@ Test-NetConnection -ComputerName 127.0.0.1 -Port 7890
 ```
 
 ### 3. 一键部署工具
-IDE 发布目录中包含 `AntigravityProxyInstaller.exe`。双击打开后，将桌面或开始菜单中的 Antigravity 快捷方式拖入窗口，工具会自动识别执行文件和目标目录，并检查 `version.dll` 与 `config.json`。检查通过后点击“复制缺少的文件”即可部署。工具默认不覆盖已有文件；覆盖前会自动备份。部署前请完全退出 Antigravity。
+IDE 发布目录中包含 `AntigravityProxyInstaller.exe`。双击打开后，将桌面或开始菜单中的 Antigravity 快捷方式拖入窗口，工具会自动识别执行文件和目标目录。点击“获取最新编译”后，工具会按目标程序架构从 GitHub `latest` Release 下载部署源，再检查并部署 `version.dll` 与 `config.json`。如果网络不可用，也可以手动选择同时包含这两个文件的部署源。工具默认不覆盖已有文件；覆盖前会自动备份。部署前请完全退出 Antigravity。
 
 ### 4. 启动目标程序
 直接启动目标程序，DLL 会自动加载并重定向网络流量。

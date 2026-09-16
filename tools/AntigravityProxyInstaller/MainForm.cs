@@ -31,6 +31,7 @@ internal sealed class MainForm : Form
     private readonly Label _versionStatusLabel = CreateStatusLabel();
     private readonly Label _configStatusLabel = CreateStatusLabel();
     private readonly Label _messageLabel = CreateMessageLabel();
+    private readonly ToolTip _toolTip = new();
     private readonly CheckBox _overwriteCheckBox = new();
     private readonly Button _deployButton = new();
     private readonly Button _buildButton = new();
@@ -46,13 +47,19 @@ internal sealed class MainForm : Form
     {
         Text = "Antigravity Proxy 部署助手";
         StartPosition = FormStartPosition.CenterScreen;
-        MinimumSize = new Size(780, 680);
-        ClientSize = new Size(880, 760);
+        AutoScaleMode = AutoScaleMode.Font;
+        MinimumSize = new Size(900, 680);
+        ClientSize = new Size(980, 760);
         Padding = new Padding(20, 16, 20, 16);
         AllowDrop = true;
         BackColor = Color.White;
 
         BuildUi();
+
+        _toolTip.AutoPopDelay = 10000;
+        _toolTip.InitialDelay = 400;
+        _toolTip.ReshowDelay = 100;
+        _toolTip.ShowAlways = true;
 
         DragEnter += OnDragEnter;
         DragDrop += OnDragDrop;
@@ -126,7 +133,7 @@ internal sealed class MainForm : Form
 
         var subtitle = new Label
         {
-            Text = "启动时自动查找已安装的 Antigravity；也可拖入快捷方式或执行文件，检查并部署代理文件",
+            Text = "自动获取 GitHub 最新构建；拖入快捷方式后检查并部署代理文件",
             AutoSize = true,
             ForeColor = ColorSubtitle,
             Margin = new Padding(0)
@@ -192,7 +199,8 @@ internal sealed class MainForm : Form
             Margin = new Padding(0)
         };
         chooser.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
-        chooser.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 106F));
+        var chooseButtonWidth = Math.Max(132, TextRenderer.MeasureText("选择文件夹", Font).Width + 28);
+        chooser.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, chooseButtonWidth));
         chooser.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
 
         _payloadDirectoryText.Dock = DockStyle.Fill;
@@ -273,8 +281,10 @@ internal sealed class MainForm : Form
             Padding = new Padding(0, 10, 0, 0)
         };
         content.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
-        content.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 132F));
-        content.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 152F));
+        var fetchButtonWidth = Math.Max(144, TextRenderer.MeasureText("获取最新编译", Font).Width + 28);
+        var deployButtonWidth = Math.Max(154, TextRenderer.MeasureText("复制缺少的文件", Font).Width + 28);
+        content.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, fetchButtonWidth));
+        content.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, deployButtonWidth));
         content.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
 
         _messageLabel.Dock = DockStyle.Fill;
@@ -282,17 +292,21 @@ internal sealed class MainForm : Form
         _messageLabel.Margin = new Padding(0, 0, 12, 0);
 
         _deployButton.Text = "复制缺少的文件";
+        _deployButton.AutoSize = false;
+        _deployButton.MinimumSize = new Size(0, 32);
         _deployButton.Dock = DockStyle.Fill;
         _deployButton.Enabled = false;
         _deployButton.Margin = new Padding(0, 2, 0, 6);
         _deployButton.UseVisualStyleBackColor = true;
         _deployButton.Click += OnDeployClick;
 
-        _buildButton.Text = "一键编译";
+        _buildButton.Text = "获取最新编译";
+        _buildButton.AutoSize = false;
+        _buildButton.MinimumSize = new Size(0, 32);
         _buildButton.Dock = DockStyle.Fill;
         _buildButton.Margin = new Padding(0, 2, 8, 6);
         _buildButton.UseVisualStyleBackColor = true;
-        _buildButton.Click += OnBuildClick;
+        _buildButton.Click += OnFetchLatestClick;
 
         content.Controls.Add(_messageLabel, 0, 0);
         content.Controls.Add(_buildButton, 1, 0);
@@ -379,11 +393,12 @@ internal sealed class MainForm : Form
     {
         return new Label
         {
-            AutoEllipsis = true,
+            AutoEllipsis = false,
             Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleLeft,
             ForeColor = ColorPending,
-            Margin = new Padding(0, 5, 0, 5)
+            Margin = new Padding(0, 5, 0, 5),
+            MinimumSize = new Size(0, 26)
         };
     }
 
@@ -523,61 +538,56 @@ internal sealed class MainForm : Form
         }
     }
 
-    private async void OnBuildClick(object? sender, EventArgs e)
+    private async void OnFetchLatestClick(object? sender, EventArgs e)
     {
         if (_buildCancellation is not null)
         {
             return;
         }
 
-        if (!NativeBuildService.TryFindBuildScript(out var scriptPath))
+        var architecture = _target?.Architecture ?? PeArchitecture.X64;
+        if (architecture is not (PeArchitecture.X86 or PeArchitecture.X64))
         {
-            ShowError("未找到项目根目录下的 build.ps1。");
+            ShowError("目前 GitHub 最新构建仅提供 x86 和 x64 版本，请手动选择匹配的部署源。");
             return;
         }
 
-        var architecture = _target?.Architecture == PeArchitecture.X86 ? "x86" : "x64";
+        var architectureName = architecture == PeArchitecture.X86 ? "x86" : "x64";
         _buildCancellation = new CancellationTokenSource();
         _buildButton.Enabled = false;
-        _buildButton.Text = "编译中...";
-        SetStatus(_messageLabel, $"正在编译 C++ 代理（Release {architecture}），请稍候", StatusKind.Pending);
+        _buildButton.Text = "获取中...";
+        SetStatus(_messageLabel, $"正在获取 GitHub 最新构建（{architectureName}），请稍候", StatusKind.Pending);
 
         try
         {
-            var result = await NativeBuildService.BuildAsync(scriptPath, architecture, _buildCancellation.Token);
-            if (!result.Succeeded)
-            {
-                var details = result.Output.Length > 1800 ? result.Output[^1800..] : result.Output;
-                ShowError($"C++ 编译失败（退出码 {result.ExitCode}）。\n{details}");
-                return;
-            }
-
-            var outputDirectory = Path.Combine(Path.GetDirectoryName(scriptPath)!, "output", "ide");
-            if (PayloadLocator.TryLoad(outputDirectory, out var payload, out var error))
-            {
-                _payload = payload;
-                UpdateView();
-                SetStatus(_messageLabel, "编译完成，已自动加载 output\\ide 部署源", StatusKind.Success);
-            }
-            else
-            {
-                ShowError($"编译完成，但无法加载部署源：{error}");
-            }
+            _payload = await RemotePayloadService.DownloadLatestAsync(
+                architecture,
+                _buildCancellation.Token);
+            UpdateView();
+            SetStatus(_messageLabel, $"已获取 GitHub 最新构建（{architectureName}），可以部署", StatusKind.Success);
+        }
+        catch (OperationCanceledException) when (_buildCancellation?.IsCancellationRequested != true)
+        {
+            ShowError("访问 GitHub 超时，请检查系统代理或网络连接，也可以手动选择部署源。");
         }
         catch (OperationCanceledException)
         {
-            SetStatus(_messageLabel, "编译已取消", StatusKind.Pending);
+            SetStatus(_messageLabel, "获取已取消", StatusKind.Pending);
+        }
+        catch (HttpRequestException ex)
+        {
+            ShowError($"无法连接 GitHub：{ex.Message}\n请检查系统代理或网络连接，也可以手动选择部署源。");
         }
         catch (Exception ex)
         {
-            ShowError($"启动编译失败：{ex.Message}");
+            ShowError($"获取最新编译失败：{ex.Message}");
         }
         finally
         {
             _buildCancellation?.Dispose();
             _buildCancellation = null;
             _buildButton.Enabled = true;
-            _buildButton.Text = "一键编译";
+            _buildButton.Text = "获取最新编译";
         }
     }
 
@@ -598,6 +608,10 @@ internal sealed class MainForm : Form
         _shortcutPathText.Text = _target?.ShortcutPath ?? "请先拖入快捷方式";
         _executablePathText.Text = _target?.ExecutablePath ?? string.Empty;
         _directoryPathText.Text = _target?.DirectoryPath ?? string.Empty;
+        _toolTip.SetToolTip(_shortcutPathText, _target?.ShortcutPath ?? string.Empty);
+        _toolTip.SetToolTip(_executablePathText, _target?.ExecutablePath ?? string.Empty);
+        _toolTip.SetToolTip(_directoryPathText, _target?.DirectoryPath ?? string.Empty);
+        _toolTip.SetToolTip(_payloadDirectoryText, _payload?.DirectoryPath ?? string.Empty);
 
         // ── 检查 ──
         _assessment = null;
@@ -627,11 +641,11 @@ internal sealed class MainForm : Form
             }
             else if (_target is not null && _payload is null)
             {
-                SetStatus(_messageLabel, "已自动找到 Antigravity，请点击“一键编译”或选择部署源", StatusKind.Pending);
+                SetStatus(_messageLabel, "已自动找到 Antigravity，请点击“获取最新编译”或选择部署源", StatusKind.Pending);
             }
             else if (_target is null && _payload is null)
             {
-                SetStatus(_messageLabel, "请先点击“一键编译”生成部署源，或拖入 Antigravity 快捷方式", StatusKind.Pending);
+                SetStatus(_messageLabel, "请先点击“获取最新编译”获取部署源，或拖入 Antigravity 快捷方式", StatusKind.Pending);
             }
             return;
         }
@@ -686,7 +700,13 @@ internal sealed class MainForm : Form
 
     private void ShowError(string message)
     {
-        SetStatus(_messageLabel, message, StatusKind.Failure);
+        var summary = message.Replace(Environment.NewLine, " ").Replace("\n", " ");
+        if (summary.Length > 96)
+        {
+            summary = summary[..96] + "…";
+        }
+
+        SetStatus(_messageLabel, summary, StatusKind.Failure);
         MessageBox.Show(this, message, "无法继续", MessageBoxButtons.OK, MessageBoxIcon.Warning);
     }
 }

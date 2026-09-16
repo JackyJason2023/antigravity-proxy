@@ -227,6 +227,10 @@ You need these files:
 
 (Download from Releases, or build them yourself.)
 
+After every update to `main`, GitHub Actions publishes a `latest` continuous-build prerelease containing x64/x86 payloads for the installer. Regular users do not need CMake, Visual Studio, or the .NET SDK.
+
+On first use, push `.github/workflows/continuous.yml` and wait for the `Continuous Payload` workflow to complete successfully. Until the `latest` release exists, the installer will correctly receive HTTP 404. The installer currently targets this checkout's `origin` repository, `JackyJason2023/antigravity-proxy`; update the repository constant if the project is moved.
+
 ### Step 3: Deploy to Antigravity
 
 Copy `version.dll` and `config.json` to Antigravity’s main program directory (next to `Antigravity.exe`). Then launch Antigravity — done.
@@ -235,7 +239,7 @@ For **Antigravity CLI**, copy `dbghelp.dll`, `version.dll`, and `config.json` ne
 
 #### One-click deployment tool
 
-The IDE package and `output\ide` include `AntigravityProxyInstaller.exe`. Open it, drag an Antigravity shortcut from the desktop or Start menu into the window, and the tool will resolve the actual executable and installation directory. It then checks whether `version.dll` and `config.json` are present. Click `Copy missing files` to deploy them after the checks pass.
+The IDE package and `output\ide` include `AntigravityProxyInstaller.exe`. Open it, drag an Antigravity shortcut from the desktop or Start menu into the window, and the tool will resolve the actual executable and installation directory. Click `Get latest build` to download the matching x64/x86 payload from the GitHub `latest` release, then deploy `version.dll` and `config.json` after validation. If GitHub is unavailable, use `Choose folder` to select a local payload containing both files.
 
 Existing files are not overwritten by default. If a file differs from the current build, enable the overwrite option; existing files are backed up first. Fully exit Antigravity before deploying.
 
@@ -569,6 +573,8 @@ If the above steps don't resolve your issue, collect this info and submit a [Git
 ### Prerequisites
 
 Before building, make sure you have the following tools installed:
+
+These prerequisites are for source developers and CI only. Regular users can obtain the GitHub `latest` payload through `AntigravityProxyInstaller.exe` without installing them.
 
 | Dependency | Version | Purpose | Download |
 |------------|---------|---------|----------|

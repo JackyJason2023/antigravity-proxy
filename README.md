@@ -229,6 +229,10 @@ Release 按架构和运行目标提供四个独立压缩包，下载时只选实
 
 每个压缩包还包含通用的 `config-web.html` 与 `使用说明.md`；自行编译时仍会在本地 `output/ide`、`output/cli` 生成两套目录。
 
+仓库 `main` 分支每次更新后，GitHub Actions 会自动生成一个 `latest` 连续构建 Release，其中包含供部署工具下载的 x64/x86 `version.dll` 与 `config.json`。这是预发布构建，正式使用仍建议下载带版本号的 Release。
+
+首次启用此功能时，需要先将 `.github/workflows/continuous.yml` 推送到仓库并等待 `Continuous Payload` workflow 成功完成；在 `latest` Release 尚未创建前，安装器收到 HTTP 404 是正常现象。当前安装器按本仓库 `origin` 配置为 `JackyJason2023/antigravity-proxy`，如果仓库改名或迁移，需要同步修改安装器中的仓库常量。
+
 ### Step 3: 部署到 Antigravity / Deploy to Antigravity
 
 桌面端只复制 `ide/` 内的文件到 **Antigravity 主程序目录**（与 `Antigravity.exe` 同级）。
@@ -241,7 +245,9 @@ Release 按架构和运行目标提供四个独立压缩包，下载时只选实
 
 #### 一键部署工具
 
-IDE 压缩包和 `output\ide` 目录中包含 `AntigravityProxyInstaller.exe`。双击打开后，将桌面或开始菜单中的 Antigravity 快捷方式拖入窗口，工具会自动识别快捷方式指向的执行文件和目标目录，并检查 `version.dll`、`config.json` 是否存在。检查通过后点击“复制缺少的文件”即可部署。
+IDE 压缩包和 `output\ide` 目录中包含 `AntigravityProxyInstaller.exe`。双击打开后，将桌面或开始菜单中的 Antigravity 快捷方式拖入窗口，工具会自动识别快捷方式指向的执行文件和目标目录。点击“获取最新编译”后，工具会按目标程序架构从 GitHub `latest` Release 下载部署源，再检查并部署 `version.dll`、`config.json`。普通用户不需要安装 CMake、Visual Studio 或 .NET SDK。
+
+如果网络无法访问 GitHub，仍可以使用“选择文件夹”，手动指定一个同时包含 `version.dll` 和 `config.json` 的部署源。工具会校验 PE 架构与 JSON 格式；这两个文件应来自同一次构建。
 
 工具默认不覆盖已有文件；如果文件内容与当前构建不同，可勾选覆盖选项，覆盖前会自动备份。部署前请完全退出 Antigravity。
 
@@ -599,6 +605,8 @@ Get-NetAdapterBinding -ComponentID ms_tcpip6
 ### 环境要求 / Prerequisites
 
 在开始编译之前，请确保已安装以下工具：
+
+以下依赖仅面向源码开发者和 CI 构建。普通用户使用 `AntigravityProxyInstaller.exe` 获取 GitHub `latest` 构建时不需要安装它们。
 
 | 依赖项 | 版本要求 | 用途 | 下载链接 |
 |--------|----------|------|----------|

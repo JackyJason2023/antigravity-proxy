@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.IO.Compression;
 using Microsoft.Win32;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -376,64 +377,127 @@ internal static class InstalledApplicationLocator
     }
 }
 
-internal sealed record BuildResult(bool Succeeded, int ExitCode, string Output);
-
-internal static class NativeBuildService
+internal static class RemotePayloadService
 {
-    public static async Task<BuildResult> BuildAsync(string scriptPath, string architecture, CancellationToken cancellationToken)
+    // The continuous workflow updates this public release after every main-branch build.
+    // Change this value when publishing the project under another GitHub repository.
+    private const string Repository = "JackyJason2023/antigravity-proxy";
+    private const string ReleaseTag = "latest";
+
+    private static readonly HttpClient Client = CreateHttpClient();
+
+    private static HttpClient CreateHttpClient()
     {
-        var root = Path.GetDirectoryName(scriptPath)
-                   ?? throw new InvalidOperationException("无法确定项目根目录。");
-        var powershell = Environment.GetEnvironmentVariable("ComSpec") is not null
-            ? "powershell.exe"
-            : "pwsh";
-        var outputEncoding = System.Text.Encoding.UTF8;
-        var escapedScriptPath = scriptPath.Replace("'", "''");
-        var command = $"[Console]::OutputEncoding = [Text.Encoding]::UTF8; & '{escapedScriptPath}' -Config Release -Arch {architecture} -SkipTests; exit $LASTEXITCODE";
-        var arguments = $"-NoProfile -ExecutionPolicy Bypass -Command \"{command.Replace("\"", "\\\"")}\"";
-        var startInfo = new ProcessStartInfo
+        // Keep the Windows/system proxy enabled so GitHub can be reached through
+        // the proxy configured by the user or the current environment.
+        var handler = new HttpClientHandler
         {
-            FileName = powershell,
-            Arguments = arguments,
-            WorkingDirectory = root,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            StandardOutputEncoding = outputEncoding,
-            StandardErrorEncoding = outputEncoding
+            UseProxy = true,
+            AllowAutoRedirect = true
         };
-
-        using var process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
-        if (!process.Start())
+        return new HttpClient(handler)
         {
-            throw new InvalidOperationException("无法启动 PowerShell 编译进程。");
-        }
-
-        var outputTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
-        var errorTask = process.StandardError.ReadToEndAsync(cancellationToken);
-        await process.WaitForExitAsync(cancellationToken);
-        var output = (await outputTask) + Environment.NewLine + (await errorTask);
-        return new BuildResult(process.ExitCode == 0, process.ExitCode, output.Trim());
+            Timeout = TimeSpan.FromMinutes(5)
+        };
     }
 
-    public static bool TryFindBuildScript(out string scriptPath)
+    public static async Task<PayloadInfo> DownloadLatestAsync(
+        PeArchitecture architecture,
+        CancellationToken cancellationToken)
     {
-        var current = new DirectoryInfo(AppContext.BaseDirectory);
-        for (var depth = 0; depth < 8 && current is not null; depth++)
+        var architectureName = architecture switch
         {
-            var candidate = Path.Combine(current.FullName, "build.ps1");
-            if (File.Exists(candidate))
+            PeArchitecture.X86 => "x86",
+            PeArchitecture.X64 => "x64",
+            _ => throw new InvalidOperationException("目前 GitHub 最新构建仅提供 x86 和 x64 版本。")
+        };
+
+        var cacheRoot = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "AntigravityProxyInstaller",
+            "payload-cache");
+        var cacheDirectory = Path.Combine(cacheRoot, architectureName);
+        var stagingDirectory = Path.Combine(cacheRoot, $".download-{architectureName}-{Guid.NewGuid():N}");
+        var archivePath = Path.Combine(stagingDirectory, "payload.zip");
+        var assetName = $"antigravity-proxy-latest-ide-win-{architectureName}.zip";
+        var assetUrl = $"https://github.com/{Repository}/releases/download/{ReleaseTag}/{assetName}?cacheBust={DateTimeOffset.UtcNow.ToUnixTimeSeconds()}";
+
+        Directory.CreateDirectory(stagingDirectory);
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, assetUrl);
+            request.Headers.UserAgent.ParseAdd("AntigravityProxyInstaller/1.0");
+            request.Headers.TryAddWithoutValidation("Cache-Control", "no-cache");
+            using var response = await Client.SendAsync(
+                request,
+                HttpCompletionOption.ResponseHeadersRead,
+                cancellationToken);
+
+            if (!response.IsSuccessStatusCode)
             {
-                scriptPath = candidate;
-                return true;
+                var publicUrl = assetUrl[..assetUrl.IndexOf('?')];
+                if ((int)response.StatusCode == 404)
+                {
+                    throw new InvalidOperationException(
+                        $"GitHub 返回 404，未找到最新构建。\n下载地址：{publicUrl}\n这通常表示 continuous workflow 尚未成功运行，或仓库/资产名称配置不一致；如果是代理问题，通常会显示连接失败而不是 404。");
+                }
+
+                throw new InvalidOperationException(
+                    $"GitHub 最新构建暂不可用（HTTP {(int)response.StatusCode}）。请稍后重试，或手动选择部署源。");
             }
 
-            current = current.Parent;
-        }
+            await using (var source = await response.Content.ReadAsStreamAsync(cancellationToken))
+            await using (var destination = new FileStream(
+                archivePath,
+                FileMode.Create,
+                FileAccess.Write,
+                FileShare.None,
+                bufferSize: 128 * 1024,
+                useAsync: true))
+            {
+                await source.CopyToAsync(destination, cancellationToken);
+            }
 
-        scriptPath = string.Empty;
-        return false;
+            var extractedDirectory = Path.Combine(stagingDirectory, "extracted");
+            ZipFile.ExtractToDirectory(archivePath, extractedDirectory);
+            if (!PayloadLocator.TryLoad(extractedDirectory, out var downloadedPayload, out var error) ||
+                downloadedPayload is null)
+            {
+                throw new InvalidDataException($"GitHub 最新构建内容无效：{error}");
+            }
+
+            Directory.CreateDirectory(cacheDirectory);
+            File.Copy(downloadedPayload.VersionDllPath,
+                Path.Combine(cacheDirectory, "version.dll"), overwrite: true);
+            File.Copy(downloadedPayload.ConfigPath,
+                Path.Combine(cacheDirectory, "config.json"), overwrite: true);
+
+            if (!PayloadLocator.TryLoad(cacheDirectory, out var cachedPayload, out error) ||
+                cachedPayload is null)
+            {
+                throw new InvalidDataException($"下载的部署源缓存失败：{error}");
+            }
+
+            return cachedPayload;
+        }
+        finally
+        {
+            try
+            {
+                if (Directory.Exists(stagingDirectory))
+                {
+                    Directory.Delete(stagingDirectory, recursive: true);
+                }
+            }
+            catch (IOException)
+            {
+                // A failed cleanup must not hide the download result.
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // A failed cleanup must not hide the download result.
+            }
+        }
     }
 }
 
