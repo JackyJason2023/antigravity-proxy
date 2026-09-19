@@ -245,11 +245,15 @@ Release 按架构和运行目标提供四个独立压缩包，下载时只选实
 
 #### 一键部署工具
 
-IDE 压缩包和 `output\ide` 目录中包含 `AntigravityProxyInstaller.exe`。双击打开后，将桌面或开始菜单中的 Antigravity 快捷方式拖入窗口，工具会自动识别快捷方式指向的执行文件和目标目录。点击“获取最新编译”后，工具会按目标程序架构从 GitHub `latest` Release 下载部署源，再检查并部署 `version.dll`、`config.json`。普通用户不需要安装 CMake、Visual Studio 或 .NET SDK。
+IDE 发布目录中包含 `AntigravityProxyInstaller.exe`。窗口按 **① 目标程序 → ② 部署源 → ③ 检查与部署** 三步组织，右下角的主按钮始终显示下一步该做的事。普通用户不需要安装 CMake、Visual Studio 或 .NET SDK。
 
-如果网络无法访问 GitHub，仍可以使用“选择文件夹”，手动指定一个同时包含 `version.dll` 和 `config.json` 的部署源。工具会校验 PE 架构与 JSON 格式；这两个文件应来自同一次构建。
+工具启动时会自动查找已安装的 Antigravity；没有检测到时主按钮变成“选择 Antigravity 程序”，也可以把桌面或开始菜单中的快捷方式拖到窗口任意位置来更换目标。
 
-工具默认不覆盖已有文件；如果文件内容与当前构建不同，可勾选覆盖选项，覆盖前会自动备份。部署前请完全退出 Antigravity。
+部署源点击“从 GitHub 获取最新构建”，工具会按目标程序架构从 GitHub `latest` Release 下载 `version.dll` 与 `config.json`，下载过程显示实时进度并支持取消。网络无法访问 GitHub 时，改用“选择文件夹…”手动指定一个同时包含这两个文件的部署源。工具会校验 PE 架构与 JSON 格式；这两个文件应来自同一次构建。
+
+③ 检查与部署 会逐行列出目标目录中的状态和将执行的操作。默认不覆盖已有文件；当文件内容与当前构建不同时，勾选“允许覆盖内容不同的文件（覆盖前先备份到 .antigravity-proxy-backup）”，主按钮变为“复制并覆盖 N 个文件”。Antigravity 正在运行时工具会提前提示而不是等到写入才失败，完全退出后该提示自动消失。
+
+部署完成后横幅提供“打开安装目录”按钮，右下角主按钮同时变成“启动 Antigravity”；当文件已经一致、无需复制时，主按钮同样直接显示“启动 Antigravity”。
 
 #### Antigravity 2.0 注意事项
 

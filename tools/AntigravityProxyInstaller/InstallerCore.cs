@@ -17,20 +17,44 @@ internal enum PeArchitecture
     Arm64
 }
 
+internal enum PayloadOrigin
+{
+    /// <summary>A folder the tool discovered next to itself, for example output\ide.</summary>
+    Bundled,
+    /// <summary>A GitHub latest build cached in %LOCALAPPDATA%.</summary>
+    Remote,
+    /// <summary>A folder the user picked manually.</summary>
+    Local
+}
+
 internal sealed class PayloadInfo
 {
-    public PayloadInfo(string directoryPath, string versionDllPath, string configPath, PeArchitecture architecture)
+    public PayloadInfo(
+        string directoryPath,
+        string versionDllPath,
+        string configPath,
+        PeArchitecture architecture,
+        PayloadOrigin origin = PayloadOrigin.Local)
     {
         DirectoryPath = directoryPath;
         VersionDllPath = versionDllPath;
         ConfigPath = configPath;
         Architecture = architecture;
+        Origin = origin;
     }
 
     public string DirectoryPath { get; }
     public string VersionDllPath { get; }
     public string ConfigPath { get; }
     public PeArchitecture Architecture { get; }
+    public PayloadOrigin Origin { get; }
+
+    public string OriginDisplay => Origin switch
+    {
+        PayloadOrigin.Remote => "GitHub 最新构建",
+        PayloadOrigin.Bundled => "随工具附带的构建",
+        _ => "手动选择的文件夹"
+    };
 }
 
 internal sealed class TargetInfo
@@ -377,12 +401,27 @@ internal static class InstalledApplicationLocator
     }
 }
 
+internal enum DownloadPhase
+{
+    Connecting,
+    Receiving,
+    Extracting,
+    Caching
+}
+
+internal readonly record struct DownloadProgress(
+    DownloadPhase Phase,
+    long? TotalBytes,
+    long BytesReceived);
+
 internal static class RemotePayloadService
 {
     // The continuous workflow updates this public release after every main-branch build.
     // Change this value when publishing the project under another GitHub repository.
     private const string Repository = "JackyJason2023/antigravity-proxy";
     private const string ReleaseTag = "latest";
+
+    public static string ReleasePageUrl { get; } = $"https://github.com/{Repository}/releases/latest";
 
     private static readonly HttpClient Client = CreateHttpClient();
 
@@ -403,7 +442,8 @@ internal static class RemotePayloadService
 
     public static async Task<PayloadInfo> DownloadLatestAsync(
         PeArchitecture architecture,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        IProgress<DownloadProgress>? progress = null)
     {
         var architectureName = architecture switch
         {
@@ -425,6 +465,8 @@ internal static class RemotePayloadService
         Directory.CreateDirectory(stagingDirectory);
         try
         {
+            Report(progress, new DownloadProgress(DownloadPhase.Connecting, null, 0));
+
             using var request = new HttpRequestMessage(HttpMethod.Get, assetUrl);
             request.Headers.UserAgent.ParseAdd("AntigravityProxyInstaller/1.0");
             request.Headers.TryAddWithoutValidation("Cache-Control", "no-cache");
@@ -446,6 +488,7 @@ internal static class RemotePayloadService
                     $"GitHub 最新构建暂不可用（HTTP {(int)response.StatusCode}）。请稍后重试，或手动选择部署源。");
             }
 
+            var totalBytes = response.Content.Headers.ContentLength;
             await using (var source = await response.Content.ReadAsStreamAsync(cancellationToken))
             await using (var destination = new FileStream(
                 archivePath,
@@ -455,9 +498,28 @@ internal static class RemotePayloadService
                 bufferSize: 128 * 1024,
                 useAsync: true))
             {
-                await source.CopyToAsync(destination, cancellationToken);
+                var buffer = new byte[128 * 1024];
+                long received = 0;
+                var lastReportTicks = Environment.TickCount64;
+                int read;
+                while ((read = await source.ReadAsync(buffer, cancellationToken)) > 0)
+                {
+                    await destination.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
+                    received += read;
+
+                    // Throttle UI updates so a fast download stays responsive; the last
+                    // chunk is reported explicitly after the loop.
+                    if (Environment.TickCount64 - lastReportTicks >= 80)
+                    {
+                        lastReportTicks = Environment.TickCount64;
+                        Report(progress, new DownloadProgress(DownloadPhase.Receiving, totalBytes, received));
+                    }
+                }
+
+                Report(progress, new DownloadProgress(DownloadPhase.Receiving, totalBytes, received));
             }
 
+            Report(progress, new DownloadProgress(DownloadPhase.Extracting, null, 0));
             var extractedDirectory = Path.Combine(stagingDirectory, "extracted");
             ZipFile.ExtractToDirectory(archivePath, extractedDirectory);
             if (!PayloadLocator.TryLoad(extractedDirectory, out var downloadedPayload, out var error) ||
@@ -466,13 +528,14 @@ internal static class RemotePayloadService
                 throw new InvalidDataException($"GitHub 最新构建内容无效：{error}");
             }
 
+            Report(progress, new DownloadProgress(DownloadPhase.Caching, null, 0));
             Directory.CreateDirectory(cacheDirectory);
             File.Copy(downloadedPayload.VersionDllPath,
                 Path.Combine(cacheDirectory, "version.dll"), overwrite: true);
             File.Copy(downloadedPayload.ConfigPath,
                 Path.Combine(cacheDirectory, "config.json"), overwrite: true);
 
-            if (!PayloadLocator.TryLoad(cacheDirectory, out var cachedPayload, out error) ||
+            if (!PayloadLocator.TryLoad(cacheDirectory, out var cachedPayload, out error, PayloadOrigin.Remote) ||
                 cachedPayload is null)
             {
                 throw new InvalidDataException($"下载的部署源缓存失败：{error}");
@@ -498,6 +561,27 @@ internal static class RemotePayloadService
                 // A failed cleanup must not hide the download result.
             }
         }
+    }
+
+    private static void Report(IProgress<DownloadProgress>? progress, DownloadProgress value)
+    {
+        progress?.Report(value);
+    }
+
+    public static string FormatFileSize(long bytes)
+    {
+        string[] units = { "B", "KB", "MB", "GB" };
+        var size = (double)bytes;
+        var unitIndex = 0;
+        while (size >= 1024 && unitIndex < units.Length - 1)
+        {
+            size /= 1024;
+            unitIndex++;
+        }
+
+        return unitIndex == 0
+            ? $"{bytes} {units[0]}"
+            : $"{size:0.#} {units[unitIndex]}";
     }
 }
 
@@ -666,7 +750,11 @@ internal static class PeArchitectureReader
 
 internal static class PayloadLocator
 {
-    public static bool TryLoad(string directoryPath, out PayloadInfo? payload, out string error)
+    public static bool TryLoad(
+        string directoryPath,
+        out PayloadInfo? payload,
+        out string error,
+        PayloadOrigin origin = PayloadOrigin.Local)
     {
         payload = null;
         error = string.Empty;
@@ -691,7 +779,7 @@ internal static class PayloadLocator
             }
 
             ValidateJson(configPath);
-            payload = new PayloadInfo(directory, versionDllPath, configPath, architecture);
+            payload = new PayloadInfo(directory, versionDllPath, configPath, architecture, origin);
             return true;
         }
         catch (Exception ex)
@@ -720,7 +808,7 @@ internal static class PayloadLocator
 
         foreach (var candidate in candidates)
         {
-            if (TryLoad(candidate, out payload, out _))
+            if (TryLoad(candidate, out payload, out _, PayloadOrigin.Bundled))
             {
                 return true;
             }
@@ -870,7 +958,7 @@ internal static class DeploymentService
             throw new InvalidOperationException("目标目录尚未通过检查，无法部署。");
         }
 
-        if (IsTargetRunning(assessment.Target))
+        if (IsApplicationRunning(assessment.Target))
         {
             throw new InvalidOperationException("Antigravity 正在运行。请完全退出 Antigravity 后再点击部署。");
         }
@@ -926,7 +1014,11 @@ internal static class DeploymentService
         return result;
     }
 
-    private static bool IsTargetRunning(TargetInfo target)
+    /// <summary>
+    /// Reports whether the selected installation is currently running. The deployment
+    /// must not copy files into a live install, so the UI also uses this as a pre-flight check.
+    /// </summary>
+    public static bool IsApplicationRunning(TargetInfo target)
     {
         var processName = Path.GetFileNameWithoutExtension(target.ExecutablePath);
         foreach (var process in Process.GetProcessesByName(processName))
@@ -952,5 +1044,52 @@ internal static class DeploymentService
         }
 
         return false;
+    }
+}
+
+internal static class AntigravityLauncher
+{
+    /// <summary>Starts the deployed Antigravity executable through the shell.</summary>
+    public static void Launch(TargetInfo target)
+    {
+        Start(new ProcessStartInfo
+        {
+            FileName = target.ExecutablePath,
+            WorkingDirectory = target.DirectoryPath,
+            UseShellExecute = true
+        });
+    }
+
+    /// <summary>Opens Explorer with the Antigravity executable selected in its install folder.</summary>
+    public static void RevealInstallDirectory(TargetInfo target)
+    {
+        Start(new ProcessStartInfo
+        {
+            FileName = "explorer.exe",
+            Arguments = $"/select,\"{target.ExecutablePath}\"",
+            UseShellExecute = true
+        });
+    }
+
+    /// <summary>Opens a http/https URL with the user's default browser.</summary>
+    public static void OpenUrl(string url)
+    {
+        Start(new ProcessStartInfo
+        {
+            FileName = url,
+            UseShellExecute = true
+        });
+    }
+
+    private static void Start(ProcessStartInfo startInfo)
+    {
+        try
+        {
+            using var process = Process.Start(startInfo);
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException($"无法打开 {startInfo.FileName}：{ex.Message}", ex);
+        }
     }
 }

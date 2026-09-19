@@ -239,9 +239,15 @@ For **Antigravity CLI**, copy `dbghelp.dll`, `version.dll`, and `config.json` ne
 
 #### One-click deployment tool
 
-The IDE package and `output\ide` include `AntigravityProxyInstaller.exe`. Open it, drag an Antigravity shortcut from the desktop or Start menu into the window, and the tool will resolve the actual executable and installation directory. Click `Get latest build` to download the matching x64/x86 payload from the GitHub `latest` release, then deploy `version.dll` and `config.json` after validation. If GitHub is unavailable, use `Choose folder` to select a local payload containing both files.
+The IDE package and `output\ide` include `AntigravityProxyInstaller.exe`. The window is organized as three steps — **① Target app → ② Payload → ③ Check & deploy** — and the primary button at the bottom right always shows the next action to take.
 
-Existing files are not overwritten by default. If a file differs from the current build, enable the overwrite option; existing files are backed up first. Fully exit Antigravity before deploying.
+The tool locates an installed Antigravity on startup. When nothing is detected the primary button becomes `Choose Antigravity app`; you can also drop a desktop or Start-menu shortcut anywhere on the window to change the target.
+
+For the payload, click `Download latest build from GitHub` to fetch `version.dll` and `config.json` for the target's architecture from the GitHub `latest` release, with live download progress and a cancel button. If GitHub is unreachable, use `Choose folder…` to point at a local directory containing both files. The tool validates the PE architecture and the JSON syntax; the two files should come from the same build.
+
+Step ③ lists the state of each file in the target directory and the action that will be taken. Existing files are not overwritten by default; when a file differs from the current build, tick `Allow overwriting files with different content (backed up to .antigravity-proxy-backup first)` and the primary button becomes `Copy and overwrite N files`. If Antigravity is running, the tool warns you up front instead of failing on write, and the warning clears itself once you fully quit it.
+
+After a successful deployment the banner offers `Open installation folder` while the primary button itself turns into `Launch Antigravity`. When the files already match and nothing needs copying, the primary button again reads `Launch Antigravity`.
 
 #### Antigravity 2.0 Notes
 
