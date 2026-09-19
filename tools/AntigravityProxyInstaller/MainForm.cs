@@ -88,7 +88,11 @@ internal sealed class MainForm : Form
         // FitToWorkArea() have settled the final size, so the window would grow down and to the
         // right of the position WinForms picked. CenterOnWorkArea() places it explicitly instead.
         StartPosition = FormStartPosition.Manual;
+        // Both boxes off: Win32 draws no caption buttons at all when neither WS_MINIMIZEBOX nor
+        // WS_MAXIMIZEBOX is set, which is the only way to drop the maximize button while keeping a
+        // resizable border — a sizing frame otherwise renders the missing button greyed out.
         MaximizeBox = false;
+        MinimizeBox = false;
         AutoScaleMode = AutoScaleMode.None;
         Font = Theme.Body;
         BackColor = Theme.WindowBackground;
